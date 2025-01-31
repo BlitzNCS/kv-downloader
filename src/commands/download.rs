@@ -53,7 +53,7 @@ impl Download {
         Download::start_download(args)
     }
 
-    fn initialize_driver(args: &DownloadArgs, credentials: &Credentials) -> Result<driver::Driver> {
+    fn initialize_driver(args: &DownloadArgs, credentials: &Credentials) -> Result<(driver::Driver, headless_chrome::Tab)> {
         let config = driver::Config {
             domain: args.song_url.as_deref()
                 .and_then(extract_domain_from_url)
@@ -63,8 +63,15 @@ impl Download {
         };
 
         let driver = driver::Driver::new(config);
+        
+        // Create a persistent tab that will be reused
+        let tab = driver.browser.new_tab()?;
+        tab.set_default_timeout(Duration::from_secs(3600)); // 1 hour timeout
+        
+        // Sign in using the persistent tab
         driver.sign_in(&credentials.user, &credentials.password)?;
-        Ok(driver)
+        
+        Ok((driver, tab))
     }
 
     fn start_download(args: DownloadArgs) -> Result<()> {
@@ -80,12 +87,8 @@ impl Download {
                 }).unwrap()
             });
 
-            // Initialize single browser instance for all downloads
-            let driver = Self::initialize_driver(&args, &credentials)?;
-
-            // Create a persistent tab that will be reused
-            let tab = driver.browser.new_tab()?;
-            tab.set_default_timeout(Duration::from_secs(3600000)); // 1 hour timeout
+            // Initialize driver and get persistent tab
+            let (driver, tab) = Self::initialize_driver(&args, &credentials)?;
 
             if args.all.is_some() {
                 tracing::info!("Collecting all track URLs...");
@@ -111,6 +114,11 @@ impl Download {
                     }
 
                     match (|| -> Result<()> {
+                        // Verify tab is still responsive
+                        if tab.evaluate("true;", true).is_err() {
+                            return Err(anyhow!("Browser tab became unresponsive"));
+                        }
+
                         let download_options = tasks::download_song::DownloadOptions {
                             count_in: args.count_in,
                             transpose: args.transpose.unwrap_or(0),
@@ -123,18 +131,19 @@ impl Download {
                         Ok(_) => tracing::info!("Successfully processed track {}", url),
                         Err(e) => {
                             tracing::error!("Failed to process {}: {}", url, e);
-                            // Keep the browser alive by sending a no-op command
-                            if let Err(e) = tab.evaluate("true;", true) {
-                                tracing::error!("Browser connection lost: {}", e);
+                            // Try to keep the browser alive
+                            if tab.evaluate("true;", true).is_err() {
+                                tracing::error!("Browser connection lost completely");
                                 return Err(anyhow!("Browser connection lost"));
                             }
+                            // Continue to next track
                             continue;
                         }
                     }
 
-                    // Keep connection alive between downloads
-                    if let Err(e) = tab.evaluate("true;", true) {
-                        tracing::error!("Browser connection lost: {}", e);
+                    // Verify tab is still alive between downloads
+                    if tab.evaluate("true;", true).is_err() {
+                        tracing::error!("Browser connection lost");
                         return Err(anyhow!("Browser connection lost"));
                     }
                 }
