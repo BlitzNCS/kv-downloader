@@ -15,6 +15,7 @@ pub struct DownloadOptions {
 pub enum DownloadError {
     NotPurchased,
     NotASongPage,
+    ResetButtonNotFound,
 }
 
 impl Display for DownloadError {
@@ -22,6 +23,7 @@ impl Display for DownloadError {
         match self {
             Self::NotPurchased => f.write_str("This track has not been purchased"),
             Self::NotASongPage => f.write_str("This doesn't look like a song page. Check the url."),
+            Self::ResetButtonNotFound => f.write_str("Reset button not found on the page"),
         }
     }
 }
@@ -32,69 +34,89 @@ impl Driver {
         let tab = self.browser.new_tab()?;
         tab.set_default_timeout(Duration::from_secs(30));
 
-        // tab.add_event_listener(Arc::new(move |event: &Event| match event {
-        //     Event::PageScreencastFrame(frame_event) => {
-        //         let bytes = BASE64_STANDARD
-        //             .decode(frame_event.params.data.clone())
-        //             .unwrap();
-        //         let ts = frame_event.params.metadata.timestamp.unwrap();
-        //         std::fs::write(format!("screencast-{}.jpg", ts), &bytes).unwrap();
-        //     }
-        //     _ => {}
-        // }))?;
-
-        // tab.start_screencast(
-        //     Some(StartScreencastFormatOption::Jpeg),
-        //     Some(80),
-        //     Some(1280),
-        //     Some(720),
-        //     Some(4),
-        // )?;
-
         tab.navigate_to(url)?.wait_until_navigated()?;
 
         if !self.is_a_song_page(&tab) {
-            tab.stop_screencast()?;
             return Err(anyhow!(DownloadError::NotASongPage));
         }
 
         if !self.is_downloadable(&tab) {
-            tab.stop_screencast()?;
             return Err(anyhow!(DownloadError::NotPurchased));
-        }
-
-        if options.count_in {
-            let el = tab.wait_for_element_with_custom_timeout("input#precount", Duration::from_secs(15))?;
-            if !el.is_checked() {
-                el.click()?;
-            }
         }
 
         self.adjust_pitch(options.transpose, &tab)?;
 
-        self.solo_and_download_tracks(&tab)?;
-
-        tab.stop_screencast()?;
+        let track_names = Driver::extract_track_names(&tab)?;
+        self.solo_and_download_tracks(&tab, &track_names, options.count_in)?;
 
         Ok(track_names)
     }
 
-    fn solo_and_download_tracks(&self, tab: &Tab) -> Result<()> {
+    fn click_reset_button(&self, tab: &Tab) -> Result<()> {
+        let reset_button = tab.wait_for_element(".mixer__reset")
+            .map_err(|_| anyhow!(DownloadError::ResetButtonNotFound))?;
+
+        reset_button.scroll_into_view()?;
+        sleep(Duration::from_secs(1));
+        reset_button.click()?;
+        sleep(Duration::from_secs(2)); // Wait for reset to take effect
+
+        Ok(())
+    }
+
+
+    fn solo_and_download_tracks(&self, tab: &Tab, track_names: &[String], count_in: bool) -> Result<()> {
         let solo_button_sel = ".track__controls.track__solo";
         let solo_buttons = tab.find_elements(solo_button_sel)?;
         let download_button = tab.find_element("a.download")?;
-        let track_names = Driver::extract_track_names(tab)?;
 
         tab.enable_debugger()?;
         sleep(Duration::from_secs(2));
+
+        // Click the reset button before processing tracks
+        self.click_reset_button(tab)?;
+
+        // Check initial count-in state
+        let mut current_count_in_state = self.is_count_in_enabled(tab)?;
+        tracing::info!("Initial count-in state: {}", if current_count_in_state { "Enabled" } else { "Disabled" });
+
         for (index, solo_btn) in solo_buttons.iter().enumerate() {
-            let track_name = track_names[index].clone();
+            let track_name = &track_names[index];
+
             tracing::info!("Processing track {} '{}'", index + 1, track_name);
             solo_btn.scroll_into_view()?;
             sleep(Duration::from_secs(2));
             solo_btn.click()?;
             sleep(Duration::from_secs(2));
 
+            // Handle count-in toggle
+            if let Ok(count_in_toggle) = tab.wait_for_element_with_custom_timeout("input#precount", Duration::from_secs(15)) {
+                if index == 0 {
+                    // For the first track (click track)
+                    if count_in && !current_count_in_state {
+                        tracing::info!("Enabling count-in for the first track");
+                        count_in_toggle.click()?;
+                        current_count_in_state = true;
+                    } else if !count_in && current_count_in_state {
+                        tracing::info!("Disabling count-in for the first track");
+                        count_in_toggle.click()?;
+                        current_count_in_state = false;
+                    }
+                } else {
+                    // For subsequent tracks
+                    if current_count_in_state {
+                        tracing::info!("Disabling count-in for track: {}", track_name);
+                        count_in_toggle.click()?;
+                        current_count_in_state = false;
+                    }
+                }
+                sleep(Duration::from_secs(1));
+            }
+
+            // Log the count-in toggle state before downloading
+            tracing::info!("Count-in toggle state for track '{}': {}", track_name, if current_count_in_state { "Enabled" } else { "Disabled" });
+
+            // Download the track
             tracing::info!("- starting download...");
             download_button.scroll_into_view()?;
             sleep(Duration::from_secs(2));
@@ -117,6 +139,12 @@ impl Driver {
 
         Ok(())
     }
+
+    fn is_count_in_enabled(&self, tab: &Tab) -> Result<bool> {
+        let count_in_toggle = tab.wait_for_element_with_custom_timeout("input#precount", Duration::from_secs(15))?;
+        Ok(count_in_toggle.is_checked())
+    }
+
 
     pub fn extract_track_names(tab: &Tab) -> Result<Vec<String>> {
         let track_names = tab.find_elements(".mixer .track .track__caption")?;
