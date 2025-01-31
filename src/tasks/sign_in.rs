@@ -1,92 +1,150 @@
 use crate::keystore::Keystore;
 use std::{thread::sleep, time::Duration};
-
 use crate::driver::Driver;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+
+const LOGIN_TIMEOUT: std::time::Duration = Duration::from_secs(30);
 
 impl Driver {
-    pub fn sign_in(&self, user: &str, pass: &str) -> Result<()> {
-        let tab = self.browser.new_tab()?;
-
-        // navigate to the homepage
-        tab.navigate_to(&format!("https://{}", self.config.domain))?
-            .wait_until_navigated()?;
-
-        // this doesn't seem to work yet...
-        if let Some(cookie) = Keystore::get_auth_cookie().ok() {
-            tracing::debug!("Cookies before:");
-            for c in tab.get_cookies()? {
-                tracing::debug!(cookie = format!("{}: {}", c.name, c.value), "🍪");
-            }
-
-            tracing::info!("Using previous cookie value");
-            tracing::debug!(cookie = serde_json::to_string(&cookie).unwrap());
-
-            // only set it if it's an authenticated session with a user id?
-            if cookie.value.contains("|u-i:") {
-                tracing::debug!("Setting cookie");
-                tab.set_cookies(vec![cookie])
-                    .expect("unable to set cookies");
-                tracing::debug!("Reloading tab...");
-                tab.reload(true, None)?;
-
-                sleep(Duration::from_secs(2));
-
-                tracing::debug!("Cookies after:");
-                for c in tab.get_cookies()? {
-                    tracing::debug!(cookie = format!("{}: {}", c.name, c.value), "🍪");
-                }
-            }
-
-            // continue to check for login link in case this cookie isn't valid anymore
+    fn validate_session(&self, tab: &headless_chrome::Tab) -> bool {
+        tracing::debug!("Validating session state...");
+        
+        // Check if we're redirected to login page
+        if tab.get_url().contains("/my/login.html") {
+            tracing::debug!("On login page - session invalid");
+            return false;
         }
 
-        tracing::info!(user = user, "Logging in user");
+        // If we can access the account page, we're definitely logged in
+        if tab.get_url().contains("/my/account") || tab.get_url().contains("/my/download") {
+            tracing::debug!("On account/download page - session valid");
+            return true;
+        }
+        
+        // Check for various logged-in indicators
+        let logged_in_indicators = [
+            ".account-menu",
+            ".user-menu",
+            ".my-account",
+            "#logout",
+            "[href*='logout']",
+        ];
 
-        let login_link = tab
-            .find_element(".navigation a[href='/my/login.html']")
-            .ok();
+        for indicator in logged_in_indicators {
+            if tab.find_element(indicator).is_ok() {
+                tracing::debug!("Found logged-in indicator: {} - session valid", indicator);
+                return true;
+            }
+        }
 
-        // if we don't have a login link, we're already signed in (from a cookie)
-        if login_link.is_none() {
-            tracing::info!(user = user, "Already signed in");
+        // Only check for login form if no logged-in indicators were found
+        if tab.find_element("#frm_login").is_ok() {
+            tracing::debug!("Login form found - session invalid");
+            return false;
+        }
+
+        // Try navigating to account page as final check
+        tracing::debug!("No clear indicators found, checking account page access...");
+        if let Ok(_) = tab.navigate_to(&format!("https://{}/my/account", self.config.domain)) {
+            sleep(Duration::from_secs(2));
+            if !tab.get_url().contains("/my/login") {
+                tracing::debug!("Can access account page - session valid");
+                return true;
+            }
+        }
+
+        tracing::debug!("No session indicators found - assuming invalid");
+        false
+    }
+
+    pub fn sign_in(&self, user: &str, pass: &str) -> Result<()> {
+        let tab = self.browser.new_tab()?;
+        tab.set_default_timeout(LOGIN_TIMEOUT);
+        
+        tracing::info!("Starting sign-in process for user: {}", user);
+        
+        // First navigate to homepage
+        tracing::info!("Navigating to homepage...");
+        tab.navigate_to(&format!("https://{}", self.config.domain))?;
+        tab.wait_until_navigated()?;
+        sleep(Duration::from_secs(3));
+
+        // Check for existing session cookie
+        if let Some(cookie) = Keystore::get_auth_cookie().ok() {
+            tracing::info!("Found previous session cookie, attempting to restore...");
+            
+            tab.set_cookies(vec![cookie])?;
+            tab.reload(true, None)?;
+            sleep(Duration::from_secs(3));
+            
+            // Validate the session
+            if self.validate_session(&tab) {
+                tracing::info!("Successfully restored previous session");
+                return Ok(());
+            }
+            tracing::info!("Previous session expired or invalid");
+        }
+
+        // Proceed with fresh login
+        tracing::info!("Performing fresh login");
+        
+        // Navigate to login page directly
+        let login_url = format!("https://{}/my/login.html", self.config.domain);
+        tracing::info!("Navigating to login page: {}", login_url);
+        tab.navigate_to(&login_url)?;
+        tab.wait_until_navigated()?;
+        sleep(Duration::from_secs(3));
+
+        // Check if we're already logged in after navigation
+        if self.validate_session(&tab) {
+            tracing::info!("Already logged in!");
             return Ok(());
         }
 
-        // visit login page
-        login_link.unwrap().click()?;
+        // Wait for and fill username field
+        tracing::info!("Filling login form...");
+        let username_field = tab.wait_for_element("#frm_login")
+            .map_err(|_| anyhow!("Could not find username field"))?;
 
-        // fill out form
-        tab.wait_for_element("#frm_login")
-            .expect("couldn't find username input")
-            .focus()?;
+        username_field.focus()?;
+        sleep(Duration::from_millis(500));
         self.type_fast(&tab, user);
+        sleep(Duration::from_secs(1));
 
-        tab.wait_for_element("#frm_password")
-            .expect("couldn't find password input")
-            .focus()?;
+        // Wait for and fill password field
+        let password_field = tab.wait_for_element("#frm_password")
+            .map_err(|_| anyhow!("Could not find password field"))?;
+            
+        password_field.focus()?;
+        sleep(Duration::from_millis(500));
         self.type_fast(&tab, pass);
+        sleep(Duration::from_secs(1));
 
-        // submit
-        tab.find_element("#sbm")
-            .expect("couldn't find submit button")
-            .click()?;
+        // Find and click submit button
+        tracing::info!("Submitting login form...");
+        let submit_button = tab.wait_for_element("#sbm")
+            .map_err(|_| anyhow!("Could not find submit button"))?;
+            
+        submit_button.click()?;
 
+        // Wait for navigation to complete
         tab.wait_until_navigated()?;
-
-        sleep(Duration::from_secs(2));
-
-        // save cookie for next time
-        let cookies = tab.get_cookies()?;
-        if let Some(session_cookie) = cookies.iter().find(|c| c.name == "karaoke-version") {
-            tracing::info!("Saving session cookie for next time");
-            tracing::debug!(
-                cookie = format!("{}: {}", session_cookie.name, session_cookie.value),
-                "🍪"
-            );
-            Keystore::set_auth_cookie(session_cookie)?;
+        sleep(Duration::from_secs(5));
+        
+        // Verify login success
+        if !self.validate_session(&tab) {
+            return Err(anyhow!("Login failed - unable to validate session"));
         }
-
+        
+        // Save new cookie for next time
+        if let Ok(cookies) = tab.get_cookies() {
+            if let Some(session_cookie) = cookies.iter().find(|c| c.name == "karaoke-version") {
+                tracing::info!("Saving new session cookie");
+                Keystore::set_auth_cookie(session_cookie)?;
+            }
+        }
+        
+        tracing::info!("Login successful!");
         Ok(())
     }
 }

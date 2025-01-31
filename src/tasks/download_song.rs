@@ -1,11 +1,10 @@
 use crate::driver::Driver;
-
 use anyhow::{anyhow, Result};
 use headless_chrome::{Element, Tab};
 use std::fmt::Display;
 use std::{error::Error, thread::sleep, time::Duration};
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct DownloadOptions {
     pub count_in: bool,
     pub transpose: i8,
@@ -16,6 +15,8 @@ pub enum DownloadError {
     NotPurchased,
     NotASongPage,
     ResetButtonNotFound,
+    DownloadTimeout,
+    BrowserError(String),
 }
 
 impl Display for DownloadError {
@@ -24,6 +25,8 @@ impl Display for DownloadError {
             Self::NotPurchased => f.write_str("This track has not been purchased"),
             Self::NotASongPage => f.write_str("This doesn't look like a song page. Check the url."),
             Self::ResetButtonNotFound => f.write_str("Reset button not found on the page"),
+            Self::DownloadTimeout => f.write_str("Download operation timed out"),
+            Self::BrowserError(msg) => write!(f, "Browser error: {}", msg),
         }
     }
 }
@@ -31,10 +34,11 @@ impl Error for DownloadError {}
 
 impl Driver {
     pub fn download_song(&self, url: &str, options: DownloadOptions) -> Result<Vec<String>> {
-        let tab = self.browser.new_tab()?;
-        tab.set_default_timeout(Duration::from_secs(30));
-
+        let tab = self.get_tab()?;
+        
+        tracing::debug!("Navigating to URL: {}", url);
         tab.navigate_to(url)?.wait_until_navigated()?;
+        sleep(Duration::from_secs(2));
 
         if !self.is_a_song_page(&tab) {
             return Err(anyhow!(DownloadError::NotASongPage));
@@ -44,13 +48,23 @@ impl Driver {
             return Err(anyhow!(DownloadError::NotPurchased));
         }
 
+        tracing::debug!("Adjusting pitch if needed");
         self.adjust_pitch(options.transpose, &tab)?;
 
-        let track_names = Driver::extract_track_names(&tab)?;
+        tracing::debug!("Extracting track names");
+        let track_names = Self::extract_track_names(&tab)?;
+        
+        tracing::debug!("Beginning download process for {} tracks", track_names.len());
         self.solo_and_download_tracks(&tab, &track_names, options.count_in)?;
 
+        // Keep connection alive after download
+        if let Err(e) = tab.evaluate("true;", true) {
+            return Err(anyhow!(DownloadError::BrowserError(e.to_string())));
+        }
+        
         Ok(track_names)
     }
+
 
     fn click_reset_button(&self, tab: &Tab) -> Result<()> {
         let reset_button = tab.wait_for_element(".mixer__reset")

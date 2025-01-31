@@ -64,6 +64,12 @@ impl AudioProcessor {
         }
     }
 
+    pub fn check_folder_exists(download_dir: &Path, song_url: &str) -> Result<bool> {
+        let song_title = Self::extract_song_title(song_url)?;
+        let song_dir = download_dir.join(&song_title);
+        Ok(song_dir.exists())
+    }
+
     pub fn process_downloads(download_dir: &Path, song_url: &str, keep_mp3s: bool) -> Result<()> {
         let song_title = Self::extract_song_title(song_url)?;
         let song_dir = download_dir.join(&song_title);
