@@ -78,7 +78,7 @@ impl Download {
         }
 
         // Process the downloaded files
-        AudioProcessor::process_downloads(download_path, args.keep_mp3s)?;
+        AudioProcessor::process_downloads(download_path, &args.song_url, args.keep_mp3s)?;
 
         Ok(())
     }

@@ -4,6 +4,7 @@ version = "0.3.0"
 edition = "2021"
 
 [dependencies]
+chrono = "0.4"
 clap = { version = "4.5.13", features = ["derive"] }
 dotenv = "0.15.0"
 headless_chrome = { version = "1.0.12", features = ["fetch"] }
@@ -23,6 +24,7 @@ base64 = "0.22.1"
 symphonia = { version = "0.5", features = ["mp3"] }
 symphonia-bundle-mp3 = "0.5"
 hound = "3.4.0"
+reqwest = { version = "0.11", features = ["blocking"] }
 
 [dev-dependencies]
 tiny_http = "0.12.0"
