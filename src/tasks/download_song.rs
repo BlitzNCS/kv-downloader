@@ -28,7 +28,7 @@ impl Display for DownloadError {
 impl Error for DownloadError {}
 
 impl Driver {
-    pub fn download_song(&self, url: &str, options: DownloadOptions) -> Result<()> {
+    pub fn download_song(&self, url: &str, options: DownloadOptions) -> Result<Vec<String>> {
         let tab = self.browser.new_tab()?;
         tab.set_default_timeout(Duration::from_secs(30));
 
@@ -76,7 +76,7 @@ impl Driver {
 
         tab.stop_screencast()?;
 
-        Ok(())
+        Ok(track_names)
     }
 
     fn solo_and_download_tracks(&self, tab: &Tab) -> Result<()> {

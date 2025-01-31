@@ -3,3 +3,4 @@ pub mod driver;
 pub mod keystore;
 pub mod prompt;
 pub mod tasks;
+pub mod audio;

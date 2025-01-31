@@ -7,6 +7,7 @@ mod driver;
 mod keystore;
 mod prompt;
 mod tasks;
+pub mod audio;
 
 #[derive(Debug, Parser)]
 #[command(name = "kv-downloader")]
