@@ -33,19 +33,23 @@ impl Display for DownloadError {
 impl Error for DownloadError {}
 
 impl Driver {
-    pub fn download_song(&self, url: &str, options: DownloadOptions) -> Result<Vec<String>> {
-        let tab = self.get_tab()?;
-        
+    pub fn download_song(&self, url: &str, options: DownloadOptions) -> anyhow::Result<Vec<String>> {
+        // Create a fresh tab for this download.
+        let tab = self.browser.new_tab()?;
+        tab.set_default_timeout(std::time::Duration::from_secs(3600));
+
         tracing::debug!("Navigating to URL: {}", url);
         tab.navigate_to(url)?.wait_until_navigated()?;
-        sleep(Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_secs(2));
 
+        // Validate that we are on a song page.
         if !self.is_a_song_page(&tab) {
-            return Err(anyhow!(DownloadError::NotASongPage));
+            return Err(anyhow::anyhow!(DownloadError::NotASongPage));
         }
 
+        // Check if the track is downloadable (i.e. it has been purchased).
         if !self.is_downloadable(&tab) {
-            return Err(anyhow!(DownloadError::NotPurchased));
+            return Err(anyhow::anyhow!(DownloadError::NotPurchased));
         }
 
         tracing::debug!("Adjusting pitch if needed");
@@ -53,15 +57,17 @@ impl Driver {
 
         tracing::debug!("Extracting track names");
         let track_names = Self::extract_track_names(&tab)?;
-        
+
         tracing::debug!("Beginning download process for {} tracks", track_names.len());
         self.solo_and_download_tracks(&tab, &track_names, options.count_in)?;
 
-        // Keep connection alive after download
-        if let Err(e) = tab.evaluate("true;", true) {
-            return Err(anyhow!(DownloadError::BrowserError(e.to_string())));
+        // Instead of immediately erroring out if the tab is unresponsive,
+        // log a warning and continue.
+        match tab.evaluate("true;", true) {
+            Ok(_) => {},
+            Err(e) => tracing::warn!("Post-download evaluation failed: {}", e),
         }
-        
+
         Ok(track_names)
     }
 
@@ -104,7 +110,7 @@ impl Driver {
             sleep(Duration::from_secs(2));
 
             // Handle count-in toggle
-            if let Ok(count_in_toggle) = tab.wait_for_element_with_custom_timeout("input#precount", Duration::from_secs(15)) {
+            if let Ok(count_in_toggle) = tab.wait_for_element_with_custom_timeout("input#precount", Duration::from_secs(60)) {
                 if index == 0 {
                     // For the first track (click track)
                     if count_in && !current_count_in_state {
@@ -155,7 +161,7 @@ impl Driver {
     }
 
     fn is_count_in_enabled(&self, tab: &Tab) -> Result<bool> {
-        let count_in_toggle = tab.wait_for_element_with_custom_timeout("input#precount", Duration::from_secs(15))?;
+        let count_in_toggle = tab.wait_for_element_with_custom_timeout("input#precount", Duration::from_secs(60))?;
         Ok(count_in_toggle.is_checked())
     }
 
@@ -257,7 +263,7 @@ impl Driver {
             .expect("can't find pitch link")
             .click()?;
 
-        sleep(Duration::from_secs(4));
+        sleep(Duration::from_secs(6));
 
         Ok(())
     }

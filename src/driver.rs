@@ -1,10 +1,10 @@
 use headless_chrome::{Browser, LaunchOptions, Tab};
 use std::sync::Arc;
 use std::time::Duration;
-use std::thread::sleep;
 use std::error::Error;
-use serde_json::Value;
 use anyhow::{Result, anyhow};
+use std::ffi::OsStr;
+
 
 pub struct Config {
     pub domain: String,
@@ -36,17 +36,17 @@ impl Driver {
             enable_logging: true,
             ignore_certificate_errors: true,
             sandbox: false,
-            additional_args: vec![
-                "--disable-dev-shm-usage",
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-gpu",
-                "--disable-software-rasterizer",
+            args: vec![
+                OsStr::new("--disable-dev-shm-usage"),
+                OsStr::new("--no-sandbox"),
+                OsStr::new("--disable-setuid-sandbox"),
+                OsStr::new("--disable-gpu"),
+                OsStr::new("--disable-software-rasterizer"),
             ],
             ..Default::default()
         })
         .expect("Unable to create headless Chromium browser");
-
+                
         if let Some(download_path) = &config.download_path {
             Self::set_download_path(&browser, download_path)
                 .expect("Failed to set download path");
@@ -93,84 +93,119 @@ impl Driver {
     }
 
     pub fn collect_all_custom_track_urls(&self) -> Result<Vec<String>> {
+        use std::time::Duration;
+        use std::thread::sleep;
+    
         let mut all_urls = Vec::new();
         let tab = self.browser.new_tab()?;
         tab.set_default_timeout(Duration::from_secs(60));
-
-        // Navigate to downloads page
+    
         tracing::info!("Navigating to downloads page...");
         tab.navigate_to(&format!("https://{}/my/download.html", self.config.domain))?;
         tab.wait_until_navigated()?;
-        sleep(Duration::from_secs(5));
-
-        // Select "Custom Backing Track" filter
+        sleep(Duration::from_secs(2));
+    
         tracing::info!("Selecting Custom Backing Track filter...");
+        // Wait for the select element and set the filter.
         tab.wait_for_element("select[name='file_type']")?;
-        
-        let js = r#"
-            let select = document.querySelector('select[name="file_type"]');
+        let set_filter_js = r#"
+          let select = document.querySelector('select[name="file_type"]');
+          if(select) {
             select.value = '1';
             select.dispatchEvent(new Event('change'));
+          }
+          true;
         "#;
-        tab.evaluate(js, true)?;
-        sleep(Duration::from_secs(5));
-
+        tab.evaluate(set_filter_js, true)?;
+        sleep(Duration::from_secs(2));
+    
         let mut page_number = 1;
         loop {
             tracing::info!("Processing page {}...", page_number);
-            
-            // Wait for table and verify content
-            tab.wait_for_element("#tab_files")?;
-            sleep(Duration::from_secs(5));
-
-            if !self.verify_table_content(&tab)? {
-                tracing::warn!("No table content found on page {}", page_number);
+            // Wait for the table rows.
+            if let Err(e) = tab.wait_for_element_with_custom_timeout("#tab_files tbody tr", Duration::from_secs(60)) {
+                tracing::warn!("Rows did not appear on page {}: {}", page_number, e);
                 break;
             }
-
-            // Extract URLs from current page
-            let js = r#"
-                Array.from(document.querySelectorAll('td.my-downloaded-files__song.min-w-120 a')).map(a => ({
-                    href: a.getAttribute('href'),
-                    title: a.textContent.trim()
-                }))
-            "#;
-            
-            let result = tab.evaluate(js, true)?;
-            if let Some(Value::Array(items)) = result.value {
-                for item in items {
-                    if let (Some(href), Some(title)) = (
-                        item.get("href").and_then(|v| v.as_str()),
-                        item.get("title").and_then(|v| v.as_str())
-                    ) {
-                        let full_url = format!("https://{}{}", self.config.domain, href);
-                        tracing::info!("Found track: {} at {}", title, full_url);
-                        all_urls.push(full_url);
+            sleep(Duration::from_secs(2)); // Allow extra time for the rows to be populated.
+    
+            // Evaluate our extraction snippet.
+            let extraction_js = r#"
+                (function(){
+                try {
+                    let tbody = document.querySelector('#tab_files tbody');
+                    if (!tbody) {
+                    return JSON.stringify({error: "No tbody found"});
                     }
+                    let rows = tbody.querySelectorAll('tr');
+                    console.log("Number of rows found:", rows.length);
+                    let links = Array.from(rows).map(function(row){
+                    let anchor = row.querySelector('td.my-downloaded-files__song.min-w-120 a');
+                    return anchor ? { href: anchor.getAttribute('href'), title: anchor.textContent.trim() } : null;
+                    }).filter(x => x !== null);
+                    return JSON.stringify(links);
+                } catch(e) {
+                    return JSON.stringify({error: e.toString()});
                 }
+                })();
+            "#;
+            let result = tab.evaluate(extraction_js, true)?;
+            tracing::debug!("Extraction result raw: {:?}", result.value);
+            
+            // Expect result.value to be a JSON string
+            if let Some(json_str) = result.value.and_then(|v| v.as_str().map(|s| s.to_owned())) {
+                let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+
+                if let serde_json::Value::Array(items) = parsed {
+                    for item in items {
+                        if let (Some(href), Some(title)) = (
+                            item.get("href").and_then(|v| v.as_str()),
+                            item.get("title").and_then(|v| v.as_str())
+                        ) {
+                            let full_url = format!("https://{}{}", self.config.domain, href);
+                            tracing::info!("Found track: {} at {}", title, full_url);
+                            all_urls.push(full_url);
+                        }
+                    }
+                } else if let Some(error) = parsed.get("error").and_then(|v| v.as_str()) {
+                    tracing::warn!("Extraction error on page {}: {}", page_number, error);
+                }
+            } else {
+                tracing::warn!("Extraction result on page {}: None", page_number);
             }
 
-            // Check for next page
-            let has_next = tab.evaluate(
-                "!!document.querySelector('.pagination a.next:not([style*=\"display: none\"])')",
-                true
-            )?;
-
-            if has_next.value.and_then(|v| v.as_bool()).unwrap_or(false) {
-                tracing::info!("Moving to page {}...", page_number + 1);
-                tab.find_element(".pagination a.next")?.click()?;
-                sleep(Duration::from_secs(5));
+            // Pagination: Get next page link.
+            let next_js = r#"
+              (function(){
+                let nextElem = document.querySelector('.pagination a.next');
+                return nextElem ? nextElem.getAttribute('href') : null;
+              })();
+            "#;
+            let next_result = tab.evaluate(next_js, true)?;
+            // Convert the result to an owned String.
+            let next_href_opt = next_result.value.and_then(|v| v.as_str().map(String::from));
+            if let Some(next_href_value) = next_href_opt {
+                tracing::info!("Found next page link: {}", next_href_value);
+                let full_next_url = if next_href_value.starts_with("http") {
+                    next_href_value
+                } else {
+                    format!("https://{}{}", self.config.domain, next_href_value)
+                };
+                tracing::info!("Navigating to next page: {}", full_next_url);
+                tab.navigate_to(&full_next_url)?;
+                tab.wait_until_navigated()?;
+                sleep(Duration::from_secs(2));
                 page_number += 1;
             } else {
                 tracing::info!("No more pages (current page: {})", page_number);
                 break;
             }
         }
-
+    
         tracing::info!("Collection complete! Found {} total tracks", all_urls.len());
         Ok(all_urls)
     }
-
+        
     pub fn type_fast(&self, tab: &Tab, text: &str) {
         for c in text.chars() {
             tab.send_character(&c.to_string())

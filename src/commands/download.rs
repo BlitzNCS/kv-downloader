@@ -8,6 +8,9 @@ use crate::{
 use anyhow::{anyhow, Result};
 use clap::{arg, Args};
 
+use std::sync::Arc;
+use headless_chrome::Tab;
+
 #[derive(Debug, Args)]
 pub struct DownloadArgs {
     #[arg(required_unless_present = "all")]
@@ -52,8 +55,8 @@ impl Download {
     pub fn run(args: DownloadArgs) -> Result<()> {
         Download::start_download(args)
     }
-
-    fn initialize_driver(args: &DownloadArgs, credentials: &Credentials) -> Result<(driver::Driver, headless_chrome::Tab)> {
+    
+    fn initialize_driver(args: &DownloadArgs, credentials: &Credentials) -> Result<(driver::Driver, Arc<Tab>)> {
         let config = driver::Config {
             domain: args.song_url.as_deref()
                 .and_then(extract_domain_from_url)
@@ -61,12 +64,12 @@ impl Download {
             headless: args.headless,
             download_path: args.download_path.clone(),
         };
-
+    
         let driver = driver::Driver::new(config);
         
         // Create a persistent tab that will be reused
         let tab = driver.browser.new_tab()?;
-        tab.set_default_timeout(Duration::from_secs(3600)); // 1 hour timeout
+        tab.set_default_timeout(Duration::from_secs(3600));
         
         // Sign in using the persistent tab
         driver.sign_in(&credentials.user, &credentials.password)?;
