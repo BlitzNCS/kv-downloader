@@ -42,7 +42,10 @@ impl Driver {
                 OsStr::new("--disable-setuid-sandbox"),
                 OsStr::new("--disable-gpu"),
                 OsStr::new("--disable-software-rasterizer"),
-            ],
+                OsStr::new("--disable-background-timer-throttling"),
+                OsStr::new("--disable-backgrounding-occluded-windows"),
+                OsStr::new("--disable-renderer-backgrounding"),
+            ],            
             ..Default::default()
         })
         .expect("Unable to create headless Chromium browser");

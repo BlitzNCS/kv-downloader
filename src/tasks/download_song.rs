@@ -68,6 +68,12 @@ impl Driver {
             Err(e) => tracing::warn!("Post-download evaluation failed: {}", e),
         }
 
+        // … after finishing the download steps
+        //tracing::info!("- '{}' complete!", track_name);
+        
+        // Close the temporary tab to free resources.
+        tab.close(true)?;
+
         Ok(track_names)
     }
 
