@@ -83,6 +83,7 @@ impl Driver {
         };
         
         tab.call_method(download_behavior_method)?;
+        tab.close(true)?; // Force-close the ephemeral tab
         Ok(())
     }
 
@@ -206,6 +207,7 @@ impl Driver {
         }
     
         tracing::info!("Collection complete! Found {} total tracks", all_urls.len());
+        tab.close(true)?; 
         Ok(all_urls)
     }
         
