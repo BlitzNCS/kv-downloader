@@ -16,8 +16,6 @@ use std::io::{BufReader, Write, Seek, SeekFrom};
 
 use std::time::Duration;
 use reqwest;
-use headless_chrome::Tab; // <-- import Tab
-
 
 pub struct AudioProcessor;
 
@@ -72,12 +70,7 @@ impl AudioProcessor {
         Ok(song_dir.exists())
     }
 
-    pub fn process_downloads(
-        tab: &Tab,              // <--- new parameter
-        download_dir: &Path,
-        song_url: &str,
-        keep_mp3s: bool
-    ) -> Result<()> {
+    pub fn process_downloads(download_dir: &Path, song_url: &str, keep_mp3s: bool) -> Result<()> {
         let song_title = Self::extract_song_title(song_url)?;
         let song_dir = download_dir.join(&song_title);
         let stems_dir = song_dir.join("STEMS");
@@ -96,18 +89,14 @@ impl AudioProcessor {
         create_dir_all(&mt_project_dir)?;
 
         let (click_path, _other_tracks) = Self::find_tracks(download_dir)?;
-        let click_duration = Self::get_mp3_duration(tab, &click_path)?;
-        let click_wav_path = Self::process_click_track(tab, &click_path, &wav_st_dir)?;
-    
-        let other_wav_paths = Self::process_non_click_tracks(
-            tab,
-            download_dir,
-            &wav_st_dir,
-            click_duration
-        )?;
-            
+        let click_duration = Self::get_mp3_duration(&click_path)?;
+        let click_wav_path = Self::process_click_track(&click_path, &wav_st_dir)?;
+        
+        // Process all non-click tracks found in the directory
+        let other_wav_paths = Self::process_non_click_tracks(download_dir, &wav_st_dir, click_duration)?;
+        
         // Convert to mono and adjust gain
-        let mono_paths = Self::convert_to_mono(tab, &click_wav_path, &other_wav_paths, &wav_mono_dir)?;
+        let mono_paths = Self::convert_to_mono(&click_wav_path, &other_wav_paths, &wav_mono_dir)?;
         
         // Move all WAV files to their respective directories
         let all_wav_files: Vec<PathBuf> = std::fs::read_dir(&wav_st_dir)?
@@ -224,14 +213,14 @@ impl AudioProcessor {
         ))
     }
 
-    fn get_mp3_duration(tab: &Tab, path: &Path) -> Result<Duration> {
-        let (spec, samples) = Self::decode_mp3(tab, path)?;
+    fn get_mp3_duration(path: &Path) -> Result<Duration> {
+        let (spec, samples) = Self::decode_mp3(path)?;
         let duration_seconds = samples.len() as f64 / (spec.channels as f64 * spec.sample_rate as f64);
         Ok(Duration::from_secs_f64(duration_seconds))
     }
 
-    fn transcode_to_wav(tab: &Tab, src: &Path, dest_dir: &Path) -> Result<PathBuf> {
-        let (spec, samples) = Self::decode_mp3(tab, src)?;  
+    fn transcode_to_wav(src: &Path, dest_dir: &Path) -> Result<PathBuf> {
+        let (spec, samples) = Self::decode_mp3(src)?;
         let dest = dest_dir.join(src.file_name().unwrap()).with_extension("wav");
         
         let mut writer = WavWriter::create(&dest, spec)?;
@@ -242,7 +231,7 @@ impl AudioProcessor {
         Ok(dest)
     }
 
-    fn decode_mp3(tab: &Tab, path: &Path) -> Result<(WavSpec, Vec<i16>)> {
+    fn decode_mp3(path: &Path) -> Result<(WavSpec, Vec<i16>)> {
         let file = File::open(path)?;
         let source = ReadOnlySource::new(BufReader::new(file));
         let mss = MediaSourceStream::new(Box::new(source), Default::default());
@@ -260,8 +249,6 @@ impl AudioProcessor {
         let channels = 2; // Force stereo
         let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
 
-        let mut packet_count = 0;
-    
         while let Ok(packet) = probed.format.next_packet() {
             match decoder.decode(&packet) {
                 Ok(buffer) => match buffer {
@@ -294,12 +281,6 @@ impl AudioProcessor {
                 Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
                 Err(e) => return Err(e.into()),
             }
-
-            packet_count += 1;
-            // Every 500 packets, do a quick "evaluate" on the tab
-            if packet_count % 500 == 0 {
-                let _ = tab.evaluate("true;", false);
-            }
         }
 
         let spec = WavSpec {
@@ -312,16 +293,12 @@ impl AudioProcessor {
         Ok((spec, samples))
     }
 
-    fn process_click_track(tab: &Tab, click_path: &Path, wav_st_dir: &Path) -> Result<PathBuf> {
-        let click_wav_path = Self::transcode_to_wav(tab, click_path, wav_st_dir)?;
-        tab.evaluate("true;", false)?;
-        Ok(click_wav_path)
+    fn process_click_track(click_path: &Path, wav_st_dir: &Path) -> Result<PathBuf> {
+        Self::transcode_to_wav(click_path, wav_st_dir)
     }
-     
 
-    fn process_non_click_tracks(tab: &Tab, dir: &Path, wav_st_dir: &Path, click_duration: Duration) -> Result<Vec<PathBuf>> {
+    fn process_non_click_tracks(dir: &Path, wav_st_dir: &Path, click_duration: Duration) -> Result<Vec<PathBuf>> {
         let mut processed_paths = Vec::new();
-
         for entry in std::fs::read_dir(dir)? {
             let path = entry?.path();
             if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
@@ -329,19 +306,18 @@ impl AudioProcessor {
                     && path.extension().map(|e| e == "mp3").unwrap_or(false)
                 {
                     let output_path = wav_st_dir.join(path.file_name().unwrap()).with_extension("wav");
-                    let track_duration = Self::get_mp3_duration(tab, &path)?;
+                    let track_duration = Self::get_mp3_duration(&path)?;
                     let padding_duration = click_duration.saturating_sub(track_duration);
-                    Self::apply_padding(tab, &path, &output_path, padding_duration)?;
+                    Self::apply_padding(&path, &output_path, padding_duration)?;
                     processed_paths.push(output_path);
                 }
             }
-            tab.evaluate("true;", false);
         }
         Ok(processed_paths)
     }
 
-    fn apply_padding(tab: &Tab, input_path: &Path, output_path: &Path, padding_duration: Duration) -> Result<()> {
-        let (spec, samples) = Self::decode_mp3(tab, input_path)?;
+    fn apply_padding(input_path: &Path, output_path: &Path, padding_duration: Duration) -> Result<()> {
+        let (spec, samples) = Self::decode_mp3(input_path)?;
         
         let mut writer = WavWriter::create(output_path, spec)?;
         
@@ -370,7 +346,7 @@ impl AudioProcessor {
         Ok(())
     }
 
-    fn convert_to_mono(_tab: &Tab, click_path: &Path, other_paths: &[PathBuf], wav_mono_dir: &Path) -> Result<Vec<PathBuf>> {
+    fn convert_to_mono(click_path: &Path, other_paths: &[PathBuf], wav_mono_dir: &Path) -> Result<Vec<PathBuf>> {
         let mut mono_paths = Vec::new();
 
         // Process click track
