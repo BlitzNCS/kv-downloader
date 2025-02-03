@@ -95,13 +95,13 @@ impl AudioProcessor {
         create_dir_all(&wav_mono_dir)?;
         create_dir_all(&mt_project_dir)?;
 
-        let (click_path, _other_tracks) = Self::find_tracks(&song_dir)?;
+        let (click_path, _other_tracks) = Self::find_tracks(download_dir)?;
         let click_duration = Self::get_mp3_duration(tab, &click_path)?;
         let click_wav_path = Self::process_click_track(tab, &click_path, &wav_st_dir)?;
     
         let other_wav_paths = Self::process_non_click_tracks(
             tab,
-            &song_dir,
+            download_dir,
             &wav_st_dir,
             click_duration
         )?;
