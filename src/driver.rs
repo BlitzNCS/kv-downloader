@@ -33,7 +33,7 @@ impl Driver {
         let browser = Browser::new(LaunchOptions {
             headless: config.headless,
             window_size: Some((1440, 1200)),
-            enable_logging: true,
+            enable_logging: false,
             ignore_certificate_errors: true,
             sandbox: false,
             args: vec![
@@ -70,7 +70,7 @@ impl Driver {
             return Err(anyhow!("Browser tab is no longer responsive"));
         }
         Ok(self.main_tab.clone())
-    }
+    }    
 
     fn set_download_path(browser: &Browser, download_path: &str) -> Result<(), Box<dyn Error>> {
         let tab = browser.new_tab()?;

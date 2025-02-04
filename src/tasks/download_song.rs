@@ -34,13 +34,14 @@ impl Error for DownloadError {}
 
 impl Driver {
     pub fn download_song(&self, url: &str, options: DownloadOptions) -> anyhow::Result<Vec<String>> {
-        // Create a fresh tab for this download.
-        let tab = self.browser.new_tab()?;
+        
+        // Reuse the existing tab if possible
+        let tab = self.get_tab()?;
         tab.set_default_timeout(std::time::Duration::from_secs(3600));
 
         tracing::debug!("Navigating to URL: {}", url);
         tab.navigate_to(url)?.wait_until_navigated()?;
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_secs(1));
 
         // Validate that we are on a song page.
         if !self.is_a_song_page(&tab) {
@@ -72,7 +73,7 @@ impl Driver {
         //tracing::info!("- '{}' complete!", track_name);
         
         // Close the temporary tab to free resources.
-        tab.close(true)?;
+        //tab.close(true)?;
 
         Ok(track_names)
     }
@@ -97,7 +98,7 @@ impl Driver {
         let download_button = tab.find_element("a.download")?;
 
         tab.enable_debugger()?;
-        sleep(Duration::from_secs(2));
+        sleep(Duration::from_secs(1));
 
         // Click the reset button before processing tracks
         self.click_reset_button(tab)?;
@@ -111,9 +112,9 @@ impl Driver {
 
             tracing::info!("Processing track {} '{}'", index + 1, track_name);
             solo_btn.scroll_into_view()?;
-            sleep(Duration::from_secs(2));
+            sleep(Duration::from_secs(1));
             solo_btn.click()?;
-            sleep(Duration::from_secs(2));
+            sleep(Duration::from_secs(1));
 
             // Handle count-in toggle
             if let Ok(count_in_toggle) = tab.wait_for_element_with_custom_timeout("input#precount", Duration::from_secs(60)) {
@@ -145,22 +146,22 @@ impl Driver {
             // Download the track
             tracing::info!("- starting download...");
             download_button.scroll_into_view()?;
-            sleep(Duration::from_secs(2));
+            sleep(Duration::from_secs(1));
             download_button.click()?;
-            sleep(Duration::from_secs(2));
+            sleep(Duration::from_secs(1));
 
             tracing::info!("- waiting for download modal...");
             tab.wait_for_element_with_custom_timeout(".begin-download", Duration::from_secs(60))
                 .expect("Timed out waiting for download modal.");
 
             tab.find_element("button.js-modal-close")?.click()?;
-            sleep(Duration::from_secs(4));
+            sleep(Duration::from_secs(1));
             tracing::info!("- '{}' complete!", track_name);
         }
 
         tracing::info!(
             "Done! Check your download folder to make sure you have all of these tracks: {:?}\n - ",
-            track_names.join("\n - ")
+            track_names.join("\\n - ")
         );
 
         Ok(())

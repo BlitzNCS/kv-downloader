@@ -1,24 +1,23 @@
+use std::sync::{Arc, Mutex};
+use headless_chrome::Tab;
+use std::time::Duration;
+use std::thread::sleep;
+use crate::driver::Driver;
+use crate::driver;
 use std::{
     env,
     fs,
     path::Path,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
-    thread::sleep,
-    time::Duration,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use crate::{
     audio::AudioProcessor,
-    driver,
     keystore::{self, Credentials},
     tasks,
 };
 use anyhow::{anyhow, Result};
 use clap::{arg, Args};
-use headless_chrome::Tab;
 
 #[derive(Debug, Args)]
 pub struct DownloadArgs {
@@ -68,12 +67,10 @@ impl Download {
         Self::start_download(args)
     }
 
-    /// Initialize the driver and create a new persistent tab.
-    /// (This persistent tab is used for keep-alive pings and connection checks.)
     fn initialize_driver(
         args: &DownloadArgs,
         credentials: &Credentials,
-    ) -> Result<(driver::Driver, Arc<Mutex<Arc<Tab>>>)> {
+    ) -> Result<(Driver, Arc<Mutex<Arc<Tab>>>)> {
         let config = driver::Config {
             domain: args
                 .song_url
@@ -84,12 +81,9 @@ impl Download {
             download_path: args.download_path.clone(),
         };
 
-        let driver = driver::Driver::new(config);
-
-        // Create a persistent tab for connection checks.
+        let driver = Driver::new(config);
         let tab = driver.browser.new_tab()?;
         tab.set_default_timeout(Duration::from_secs(3600));
-        // Sign in using a separate method (which itself may create its own tab).
         driver.sign_in(&credentials.user, &credentials.password)?;
 
         Ok((driver, Arc::new(Mutex::new(tab))))
@@ -102,28 +96,33 @@ impl Download {
             .map(Path::new)
             .ok_or_else(|| anyhow!("Download directory must be specified with --download-path"))?;
 
-        if !args.skip_download {
-            let credentials = credentials_from_env().unwrap_or_else(|| {
-                keystore::Keystore::get_credentials().map_err(|e| {
-                    anyhow!(
-                        "Authentication required. Run `kv-downloader auth` first.\n{}",
-                        e
-                    )
-                })
-                .unwrap()
-            });
+        // Get credentials and initialize driver before any operations
+        let credentials = credentials_from_env().unwrap_or_else(|| {
+            keystore::Keystore::get_credentials().map_err(|e| {
+                anyhow!(
+                    "Authentication required. Run `kv-downloader auth` first.\n{}",
+                    e
+                )
+            })
+            .unwrap()
+        });
 
-            // Initialize the driver and create our shared persistent tab.
-            let (driver, persistent_tab) = Self::initialize_driver(&args, &credentials)?;
+        // Initialize the driver and create our shared persistent tab
+        let driver_and_tab: Option<(Driver, Arc<Mutex<Arc<Tab>>>)> = if !args.skip_download {
+            let (driver, tab) = Self::initialize_driver(&args, &credentials)?;
+            Some((driver, tab))
+        } else {
+            None
+        };
 
-            // Spawn a keep-alive thread that pings the persistent tab every 30 seconds.
-            let keep_alive_flag = Arc::new(AtomicBool::new(false));
-            let keep_alive_tab = Arc::clone(&persistent_tab);
+        // Set up keep-alive if we have a driver
+        let keep_alive_flag = Arc::new(AtomicBool::new(false));
+        let keep_alive_handle = if let Some((_, ref persistent_tab)) = driver_and_tab {
+            let keep_alive_tab: Arc<Mutex<Arc<Tab>>> = Arc::clone(persistent_tab);
             let keep_alive_flag_clone = Arc::clone(&keep_alive_flag);
-            let keep_alive_handle = std::thread::spawn(move || {
+            let handle = std::thread::spawn(move || {
                 while !keep_alive_flag_clone.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_secs(30));
-                    // Lock and use the current persistent tab.
                     let tab = keep_alive_tab.lock().unwrap();
                     if let Err(e) = tab.evaluate("true;", true) {
                         tracing::warn!("Keep-alive ping failed: {}", e);
@@ -132,8 +131,14 @@ impl Download {
                     }
                 }
             });
+            Some(handle)
+        } else {
+            None
+        };
 
-            if let Some(skip_count) = args.all {
+        // Process URLs
+        if let Some(skip_count) = args.all {
+            if let Some((ref driver, ref persistent_tab)) = driver_and_tab {
                 // In all mode, reuse the saved track list if the --reuse flag is set.
                 let track_list_path = download_path.join("track_list.json");
                 let urls: Vec<String> = if args.reuse && track_list_path.exists() {
@@ -144,14 +149,13 @@ impl Download {
                         .map_err(|e| anyhow!("Failed to parse track list: {}", e))?
                 } else {
                     tracing::info!("Collecting all track URLs...");
-                    let urls = driver.collect_all_custom_track_urls()?;
+                    let urls: Vec<String> = driver.collect_all_custom_track_urls()?;
                     tracing::info!("Found {} tracks to download", urls.len());
                     fs::write(&track_list_path, serde_json::to_string_pretty(&urls)?)
                         .map_err(|e| anyhow!("Failed to write track list file: {}", e))?;
                     urls
                 };
 
-                let skip_count = skip_count;
                 if skip_count > 0 {
                     tracing::info!("Skipping first {} tracks", skip_count);
                 }
@@ -174,84 +178,71 @@ impl Download {
                         sleep(Duration::from_secs(5));
                     }
 
-                    // Before processing each track, check if our persistent tab is still valid.
+                    // Before processing each track, check if our persistent tab is still valid
                     {
-                        let mut tab_lock = persistent_tab.lock().unwrap();
-                        if tab_lock.evaluate("true;", true).is_err() {
+                        // Put this in its own scope so the lock is dropped before download
+                        let tab_valid = {
+                            let tab_lock: std::sync::MutexGuard<Arc<Tab>> = persistent_tab.lock().unwrap();
+                            tab_lock.evaluate("true;", true).is_ok()
+                        };
+
+                        if !tab_valid {
+                            // Only acquire the lock again if we need to reinitialize
+                            let mut tab_lock = persistent_tab.lock().unwrap();
                             tracing::warn!("Persistent tab lost connection, reinitializing it");
                             *tab_lock = driver.browser.new_tab()?;
                             tab_lock.set_default_timeout(Duration::from_secs(3600));
                             driver.sign_in(&credentials.user, &credentials.password)?;
+                            // Lock is dropped here
                         }
                     }
 
-                    // Process the track in a closure.
+                    // Now the persistent tab lock is dropped, we can safely do the download
                     match (|| -> Result<()> {
-                        // (driver.download_song creates its own temporary tab for downloading and closes it when done)
                         let download_options = tasks::download_song::DownloadOptions {
                             count_in: args.count_in,
                             transpose: args.transpose.unwrap_or(0),
                         };
 
-                        let _track_names = driver.download_song(url, download_options)?;
+                        let _: Vec<String> = driver.download_song(url, download_options)?;
                         AudioProcessor::process_downloads(download_path, url, args.keep_mp3s)?;
                         Ok(())
                     })() {
                         Ok(_) => tracing::info!("Successfully processed track {}", url),
                         Err(e) => {
                             tracing::error!("Failed to process {}: {}", url, e);
-                            // Instead of aborting, try to reinitialize the persistent tab if needed.
-                            let mut tab_lock = persistent_tab.lock().unwrap();
-                            if tab_lock.evaluate("true;", true).is_err() {
-                                tracing::warn!("Persistent tab lost connection during error handling, reinitializing it");
-                                *tab_lock = driver.browser.new_tab()?;
-                                tab_lock.set_default_timeout(Duration::from_secs(3600));
-                                driver.sign_in(&credentials.user, &credentials.password)?;
-                            }
                             continue;
                         }
                     }
-
-                    // (Optionally, one more check can be performed here.)
-                    {
-                        let mut tab_lock = persistent_tab.lock().unwrap();
-                        if tab_lock.evaluate("true;", true).is_err() {
-                            tracing::warn!("Persistent tab unresponsive after processing track; reinitializing");
-                            *tab_lock = driver.browser.new_tab()?;
-                            tab_lock.set_default_timeout(Duration::from_secs(3600));
-                            driver.sign_in(&credentials.user, &credentials.password)?;
-                        }
-                    }
                 }
-            } else if let Some(ref url) = args.song_url {
-                // For a single track download.
-                if AudioProcessor::check_folder_exists(download_path, url)? {
-                    tracing::info!("Skipping download - folder already exists: {}", url);
-                    return Ok(());
-                }
-
-                let download_options = tasks::download_song::DownloadOptions {
-                    count_in: args.count_in,
-                    transpose: args.transpose.unwrap_or(0),
-                };
-
-                let _track_names = driver.download_song(url, download_options)?;
-                AudioProcessor::process_downloads(download_path, url, args.keep_mp3s)?;
+            }
+        } else if let Some(ref url) = args.song_url {
+            // For a single track download.
+            if AudioProcessor::check_folder_exists(download_path, url)? {
+                tracing::info!("Skipping download - folder already exists: {}", url);
+                return Ok(());
             }
 
-            // Signal the keep-alive thread to stop and join it.
+            if !args.skip_download {
+                if let Some((ref driver, _)) = driver_and_tab {
+                    let download_options = tasks::download_song::DownloadOptions {
+                        count_in: args.count_in,
+                        transpose: args.transpose.unwrap_or(0),
+                    };
+
+                    let _: Vec<String> = driver.download_song(url, download_options)?;
+                    AudioProcessor::process_downloads(download_path, url, args.keep_mp3s)?;
+                }
+            } else {
+                println!("Skipping download process...");
+                AudioProcessor::process_downloads(download_path, url, args.keep_mp3s)?;
+            }
+        }
+
+        // Clean up keep-alive thread if it exists
+        if let Some(handle) = keep_alive_handle {
             keep_alive_flag.store(true, Ordering::Relaxed);
-            let _ = keep_alive_handle.join();
-        } else {
-            println!("Skipping download process...");
-            if let Some(ref url) = args.song_url {
-                // Even in skip_download mode, check if the track folder exists.
-                if AudioProcessor::check_folder_exists(download_path, url)? {
-                    tracing::info!("Skipping processing - folder already exists: {}", url);
-                    return Ok(());
-                }
-                AudioProcessor::process_downloads(download_path, url, args.keep_mp3s)?;
-            }
+            let _ = handle.join();
         }
 
         Ok(())
