@@ -140,7 +140,9 @@ impl Driver {
         if let Ok(cookies) = tab.get_cookies() {
             if let Some(session_cookie) = cookies.iter().find(|c| c.name == "karaoke-version") {
                 tracing::info!("Saving new session cookie");
-                Keystore::set_auth_cookie(session_cookie)?;
+                if let Err(e) = Keystore::set_auth_cookie(session_cookie) {
+                    tracing::warn!("Failed to save session cookie to keystore: {}", e);
+                }
             }
         }
         
